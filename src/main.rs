@@ -3,6 +3,8 @@ extern crate getopts;
 extern crate gif;
 extern crate ordered_float;
 extern crate sdl2;
+extern crate futures;
+extern crate futures_cpupool;
 
 mod asyncrenderer;
 mod color;

@@ -11,6 +11,7 @@ use sdl2::render::Texture;
 use settings::PlasmaSettings;
 use std::f32;
 use std::time::Instant;
+use futures::Future;
 
 struct PlasmaState<'a> {
     clock_instant: Instant,
@@ -89,8 +90,8 @@ pub fn run_interactive(settings: PlasmaSettings) {
     };
 
     // Start an async render on the current_genome
+    println!("Current Genome {:?}", state.current_genome);
     state.renderer.set_genome(&state.current_genome);
-    state.renderer.render(state.width as usize, state.height as usize, 0.0);
 
     // Calculate some useful constants
     let frame_delay_seconds = 1.0/(settings.rendering.frames_per_second as f64);
@@ -98,26 +99,19 @@ pub fn run_interactive(settings: PlasmaSettings) {
 
     loop {
         // If a frame is due, put it on the screen
-        if state.frame_deadline_seconds <= state.clock_seconds() {
-            if let Some(image) = state.renderer.get_image() {
-                // We have a frame, and it's due. Display it!
-                // But before we do, start a render of the next frame
-                state.frame_deadline_seconds = state.clock_seconds() + frame_delay_seconds;
-                let adj_time = ((state.frame_deadline_seconds*time_scale_factor) as f32).wrap();
-                state.renderer.render(state.width as usize, state.height as usize, adj_time);
-
-                // Resize texture if necessary
-                let query = state.current_texture.query();
-                if (image.width, image.height) != (query.width as usize, query.height as usize) {
-                    state.current_texture = texture_creator.
-                        create_texture_streaming(PixelFormatEnum::RGB24, state.width, state.height).unwrap();
-                }
-                // Update texture, screen
-                state.current_texture.update(None, &image.pixel_data[..], image.width*3).unwrap();
-                canvas.copy(&state.current_texture, None, None).unwrap();
-                canvas.present();
-            }
+        state.frame_deadline_seconds = state.clock_seconds() + frame_delay_seconds;
+        let adj_time = ((state.frame_deadline_seconds*time_scale_factor) as f32).wrap();
+        let image = state.renderer.render(state.width as usize, state.height as usize, adj_time).wait().unwrap();
+        // Resize texture if necessary
+        let query = state.current_texture.query();
+        if (image.width, image.height) != (query.width as usize, query.height as usize) {
+            state.current_texture = texture_creator.
+                create_texture_streaming(PixelFormatEnum::RGB24, state.width, state.height).unwrap();
         }
+        // Update texture, screen
+        state.current_texture.update(None, &image.pixel_data[..], image.width*3).unwrap();
+        canvas.copy(&state.current_texture, None, None).unwrap();
+        canvas.present();
 
         // Calculate wait_time
         let wait_time_seconds = frame_delay_seconds.min(0.005);

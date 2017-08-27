@@ -4,13 +4,15 @@ use settings::RenderingSettings;
 use std::thread;
 use std::sync::mpsc;
 use std::sync::mpsc::{Receiver, Sender, RecvError};
+use futures::{Future, BoxFuture};
+use futures_cpupool::{CpuPool, CpuFuture};
 
 pub struct AsyncRenderer {
-    request_tx: Sender<Request>,
-    response_rx: Receiver<Response>,
     last_request_id: u32,
     genome: Option<Genome>,
-    genome_set: bool
+    genome_set: bool,
+    settings: RenderingSettings,
+    pool: CpuPool
 }
 
 struct Request {
@@ -28,19 +30,14 @@ struct Response {
 
 impl AsyncRenderer {
     pub fn new(settings: &RenderingSettings) -> AsyncRenderer {
-        let (request_tx, request_rx) = mpsc::channel();
-        let (response_tx, response_rx) = mpsc::channel();
+        let pool = CpuPool::new_num_cpus();
         let settings_clone = settings.clone();
-        thread::spawn(|| {
-            AsyncRenderer::thread(request_rx, response_tx, settings_clone);
-        });
-
         AsyncRenderer {
-            request_tx: request_tx,
-            response_rx: response_rx,
             last_request_id: 0,
             genome: None,
-            genome_set: false
+            genome_set: false,
+            settings: settings_clone,
+            pool: pool
         }
     }
 
@@ -51,66 +48,21 @@ impl AsyncRenderer {
 
     pub fn set_genome(&mut self, genome: &Genome) {
         self.genome = Some(genome.clone());
+        println!("WE SET THE GENEOME {:?}", self.genome);
         self.genome_set = true;
         self.next_request_id(); // Increment request ID to invalidate previous requests
     }
 
-    pub fn render(&mut self, width: usize, height: usize, time: f32) {
+    pub fn render(&mut self, width: usize, height: usize, time: f32) -> CpuFuture<Image, u32> {
         assert!(self.genome_set, "Must call set_genome() before calling render()");
-        let request = Request {
-            request_id: self.next_request_id(),
-            genome: self.genome.take(),
-            width: width,
-            height: height,
-            time: time
-        };
-        self.request_tx.send(request).unwrap();
-    }
-
-    pub fn get_image(&mut self) -> Option<Image> {
-        while let Ok(response) = self.response_rx.try_recv() {
-            if response.request_id == self.last_request_id {
-                return Some(response.image);
-            }
-        }
-        None
-    }
-
-    fn thread(rx: Receiver<Request>, tx: Sender<Response>, settings: RenderingSettings) {
-        let mut renderer = None;
-        loop {
-            // Wait for a new request
-            let mut request = match rx.recv() {
-                Ok(request) => request,
-                Err(RecvError) => return
-            };
-
-            // Fast-forward through backlog (if any) to get to the latest request
-            while let Ok(req) = rx.try_recv() {
-                let old_genome = request.genome;
-                request = req;
-                // Use previous genome if none specified
-                request.genome = request.genome.or(old_genome);
-            }
-
-            // Render frame
-            if let Some(genome) = request.genome {
-                // If genome has changed since last render, rebuild renderer
-                renderer = Some(PlasmaRenderer::new(&genome, &settings));
-            }
-            let mut image = Image::new(request.width, request.height);
-            renderer.as_mut().unwrap().render(&mut image, request.time);
-            let response = Response {
-                request_id: request.request_id,
-                image: image
-            };
-
-            // Send response back to main thread
-            if tx.send(response).is_err() {
-                // User quit in the middle of us processing the request
-                return;
-            }
-        }
+        let genome = self.genome.clone().unwrap();
+        let settings = self.settings.clone();
+        let mut renderer = PlasmaRenderer::new(&genome, &settings);
+        return self.pool.spawn_fn(move || {
+            let mut image = Image::new(width, height);
+            renderer.render(&mut image, time);
+            return Ok(image)
+        });
     }
 }
 
@@ -147,16 +99,6 @@ mod tests {
         }
     }
 
-    fn wait_for_image(renderer: &mut AsyncRenderer) -> Image {
-        for _ in 0..100 {
-            if let Some(image) = renderer.get_image() {
-                return image;
-            }
-            sleep(Duration::from_millis(5));
-        }
-        panic!("Never got image from AsyncRenderer");
-    }
-
     /*
      *  Tests
      */
@@ -167,11 +109,7 @@ mod tests {
         let genome = rand_genome();
         let mut ar = AsyncRenderer::new(&dummy_settings());
         ar.set_genome(&genome);
-        ar.render(32, 32, 0.0);
-
-        // Assert that image is not available right away, but that we eventually get it
-        assert!(ar.get_image().is_none());
-        let image1 = wait_for_image(&mut ar);
+        let image1 = ar.render(32, 32, 0.0).get();
 
         // Compare image with regular Renderer
         let mut r = PlasmaRenderer::new(&genome, &dummy_settings());
